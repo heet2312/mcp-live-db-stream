@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: mcp-live-db-stream
+    static_configs:
+      - targets: ['mcp-server:3000']
+    metrics_path: /metrics

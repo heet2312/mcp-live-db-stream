@@ -1,0 +1,12 @@
+name: mcp-live-db-stream
+version: 1.0.0
+description: Stream MongoDB change events and SQL Server CDC to AI agents in real-time via Streamable HTTP MCP
+transport: http
+url: http://localhost:3000/mcp
+tools:
+  - watch_mongo_collection
+  - watch_sql_table
+  - list_watchers
+  - stop_watcher
+resources:
+  - change://log
