@@ -2,17 +2,23 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { startMongoWatcher } from '../streams/mongo.js';
+import { startMongoDatabaseWatcher } from '../streams/mongo.js';
 import { registry } from '../state/sessionRegistry.js';
 import { config } from '../config.js';
 import { metrics } from '../utils/metrics.js';
 import { logger } from '../utils/logger.js';
 import type { ChangeEvent } from '../types/index.js';
 
-export const watchMongoCollectionSchema = z.object({
+export const watchMongoDatabaseSchema = z.object({
   connectionUri: z.string().url().describe('MongoDB connection string (mongodb:// or mongodb+srv://)'),
-  database: z.string().min(1).max(64).describe('MongoDB database name'),
-  collection: z.string().min(1).max(128).describe('Collection to watch for changes'),
+  database: z.string().min(1).max(64).describe('MongoDB database to watch'),
+  collections: z
+    .array(z.string().min(1).max(128))
+    .optional()
+    .describe(
+      'Collections to include. Omit (or pass an empty array) to watch every collection in the database. ' +
+      'Example: ["products","orders"] to monitor multiple collections simultaneously.',
+    ),
   operationTypes: z
     .array(z.enum(['insert', 'update', 'delete', 'replace']))
     .default(['insert', 'update', 'delete', 'replace'])
@@ -21,8 +27,7 @@ export const watchMongoCollectionSchema = z.object({
     .array(z.record(z.unknown()))
     .optional()
     .describe(
-      'Additional MongoDB aggregation pipeline stages appended after the built-in operationType filter. ' +
-      'Use to pre-filter events server-side, e.g. [{"$match":{"fullDocument.inventory":{"$lt":10}}}]. ' +
+      'Additional MongoDB aggregation pipeline stages appended after the built-in operationType/collection filter. ' +
       'Only $match, $project, $addFields, $replaceRoot, and $redact are allowed in change stream pipelines.',
     ),
   tls: z.boolean().optional().describe('Enable TLS/SSL. Auto-enabled for mongodb+srv:// URIs.'),
@@ -39,13 +44,13 @@ export const watchMongoCollectionSchema = z.object({
     .min(1)
     .max(128)
     .optional()
-    .describe('Custom label for this watcher (any string, e.g. "products-inventory"). Auto-generated UUID if omitted.'),
+    .describe('Custom label for this watcher (any string). Auto-generated UUID if omitted.'),
 });
 
-export type WatchMongoCollectionArgs = z.infer<typeof watchMongoCollectionSchema>;
+export type WatchMongoDatabaseArgs = z.infer<typeof watchMongoDatabaseSchema>;
 
-export async function watchMongoCollectionHandler(
-  args: WatchMongoCollectionArgs,
+export async function watchMongoDatabaseHandler(
+  args: WatchMongoDatabaseArgs,
   sessionId: string,
   server: McpServer,
 ): Promise<CallToolResult> {
@@ -63,6 +68,7 @@ export async function watchMongoCollectionHandler(
     }
 
     const watcherId = args.watcherId ?? uuidv4();
+    const collections = args.collections?.length ? args.collections : undefined;
 
     const onEvent = async (event: ChangeEvent): Promise<void> => {
       const s = registry.getSession(sessionId);
@@ -90,21 +96,23 @@ export async function watchMongoCollectionHandler(
     };
 
     const onError = (error: Error): void => {
-      logger.error('MongoDB watcher error', { watcherId, sessionId, error: error.message });
+      logger.error('MongoDB database watcher error', { watcherId, sessionId, error: error.message });
     };
 
-    const handle = await startMongoWatcher({
+    const handle = await startMongoDatabaseWatcher({
       connectionUri: args.connectionUri,
       database: args.database,
-      collection: args.collection,
       operationTypes: args.operationTypes,
       watcherId,
       sessionId,
       onEvent,
       onError,
+      ...(collections !== undefined ? { collections } : {}),
       ...(args.pipeline !== undefined ? { pipeline: args.pipeline as Record<string, unknown>[] } : {}),
       ...(args.tls !== undefined ? { tls: args.tls } : {}),
-      ...(args.tlsAllowInvalidCertificates !== undefined ? { tlsAllowInvalidCertificates: args.tlsAllowInvalidCertificates } : {}),
+      ...(args.tlsAllowInvalidCertificates !== undefined
+        ? { tlsAllowInvalidCertificates: args.tlsAllowInvalidCertificates }
+        : {}),
       ...(args.tlsCAFile !== undefined ? { tlsCAFile: args.tlsCAFile } : {}),
     });
 
@@ -117,12 +125,13 @@ export async function watchMongoCollectionHandler(
           type: 'text',
           text: JSON.stringify({
             watcherId,
-            target: `${args.database}.${args.collection}`,
+            database: args.database,
+            collections: collections ?? 'all',
             operationTypes: args.operationTypes,
             hasPipeline: (args.pipeline?.length ?? 0) > 0,
             fullDocumentMode: 'updateLookup',
             message:
-              'Watching MongoDB collection. Events are appended to change://log and a ' +
+              'Watching MongoDB database. Events are appended to change://log and a ' +
               'notifications/resources/updated notification is sent after each one. ' +
               'Call get_change_log to read events. Call stop_watcher to unsubscribe.',
           }, null, 2),

@@ -1,4 +1,9 @@
+import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+export const stopWatcherSchema = z.object({
+  watcherId: z.string().uuid().describe('The watcherId returned when the watcher was created.'),
+});
 import { registry } from '../state/sessionRegistry.js';
 import { metrics } from '../utils/metrics.js';
 import { logger } from '../utils/logger.js';

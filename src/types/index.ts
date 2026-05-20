@@ -26,9 +26,11 @@ export interface WatcherConfig {
 }
 
 export interface WatcherHandle extends WatcherConfig {
-  status: 'active' | 'error' | 'stopped';
+  status: 'active' | 'retrying' | 'error' | 'stopped';
   eventCount: number;
   lastEventAt: string | undefined;
+  lastError: string | undefined;
+  hasResumeToken: boolean;
   stop: () => Promise<void>;
 }
 

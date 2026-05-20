@@ -62,6 +62,7 @@ export async function startSqlWatcher(cfg: SqlWatchConfig): Promise<WatcherHandl
   let stopped = false;
   let eventCount = 0;
   let lastEventAt: string | undefined;
+  let lastError: string | undefined;
   let status: WatcherHandle['status'] = 'active';
   let pollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -192,7 +193,8 @@ export async function startSqlWatcher(cfg: SqlWatchConfig): Promise<WatcherHandl
       }
     } catch (err) {
       if (stopped) return;
-      log.error('SQL poll error', { err: err instanceof Error ? err.message : String(err) });
+      lastError = err instanceof Error ? err.message : String(err);
+      log.error('SQL poll error', { err: lastError });
       metrics.watcherErrorsTotal.inc({ source: 'sql', error_type: 'poll_error' });
       cfg.onError(err instanceof Error ? err : new Error(String(err)));
     }
@@ -214,6 +216,8 @@ export async function startSqlWatcher(cfg: SqlWatchConfig): Promise<WatcherHandl
       get status() { return status; },
       get eventCount() { return eventCount; },
       get lastEventAt() { return lastEventAt; },
+      get lastError() { return lastError; },
+      hasResumeToken: false,
       stop: async () => {
         stopped = true;
         status = 'stopped';

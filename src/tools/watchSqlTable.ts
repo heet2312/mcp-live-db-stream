@@ -10,13 +10,13 @@ import { logger } from '../utils/logger.js';
 import type { ChangeEvent } from '../types/index.js';
 
 export const watchSqlTableSchema = z.object({
-  server: z.string().min(1),
-  database: z.string().min(1),
-  username: z.string().min(1),
-  password: z.string().min(1),
-  table: z.string().regex(/^\w+\.\w+$/, 'Must be schema.tablename format'),
-  pollIntervalMs: z.number().int().min(500).max(60000).default(2000),
-  watcherId: z.string().uuid().optional(),
+  server: z.string().min(1).describe('SQL Server hostname or IP address'),
+  database: z.string().min(1).describe('Database name'),
+  username: z.string().min(1).describe('SQL Server login username'),
+  password: z.string().min(1).describe('SQL Server login password'),
+  table: z.string().regex(/^\w+\.\w+$/, 'Must be schema.tablename format').describe('Table to watch in schema.tablename format, e.g. dbo.products'),
+  pollIntervalMs: z.number().int().min(500).max(60000).default(2000).describe('CDC polling interval in milliseconds (500–60000). Defaults to 2000.'),
+  watcherId: z.string().min(1).max(128).optional().describe('Custom label for this watcher (any string). Auto-generated UUID if omitted.'),
 });
 
 export type WatchSqlTableArgs = z.infer<typeof watchSqlTableSchema>;

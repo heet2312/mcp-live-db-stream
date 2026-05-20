@@ -16,6 +16,8 @@ export async function listWatchersHandler(sessionId: string): Promise<CallToolRe
       eventCount: w.eventCount,
       createdAt: w.createdAt,
       lastEventAt: w.lastEventAt,
+      hasResumeToken: w.hasResumeToken,
+      ...(w.lastError !== undefined ? { lastError: w.lastError } : {}),
     }));
 
     return {

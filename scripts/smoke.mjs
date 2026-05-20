@@ -103,7 +103,7 @@ await check('POST /mcp with initialized notification returns 200', async () => {
 // ── Step 3: List tools ────────────────────────────────────────────────────────
 console.log('\n[3] tools/list');
 
-await check('Returns all 4 tools', async () => {
+await check('Returns all 7 tools', async () => {
   const res = await fetch(`${BASE}/mcp`, {
     method: 'POST',
     headers: { ...MCP_HEADERS, 'mcp-session-id': sessionId },
@@ -120,10 +120,19 @@ await check('Returns all 4 tools', async () => {
   const tools = body.result?.tools ?? [];
   const names = tools.map(t => t.name);
 
-  const expected = ['watch_mongo_collection', 'watch_sql_table', 'list_watchers', 'stop_watcher'];
+  const expected = [
+    'query_mongo_collection',
+    'watch_mongo_collection',
+    'watch_mongo_database',
+    'get_change_log',
+    'watch_sql_table',
+    'list_watchers',
+    'stop_watcher',
+  ];
   for (const name of expected) {
     if (!names.includes(name)) throw new Error(`Missing tool: ${name}`);
   }
+  console.log(`    All tools: ${names.join(', ')}`);
 });
 
 // ── Step 4: Health check ──────────────────────────────────────────────────────

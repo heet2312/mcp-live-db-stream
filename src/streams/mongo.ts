@@ -1,137 +1,219 @@
 import { MongoClient, ServerApiVersion } from 'mongodb';
-import type { Document, ResumeToken } from 'mongodb';
+import type { Document, ResumeToken, ChangeStream } from 'mongodb';
 import type { ChangeEvent, OperationType, WatcherHandle } from '../types/index.js';
 import type { SupportedChangeDoc } from '../utils/format.js';
 import { formatMongoEvent } from '../utils/format.js';
 import { logger } from '../utils/logger.js';
 import { metrics } from '../utils/metrics.js';
 
-export interface MongoWatchConfig {
+interface BaseCfg {
   connectionUri: string;
   database: string;
-  collection: string;
+  tls?: boolean;
+  tlsAllowInvalidCertificates?: boolean;
+  tlsCAFile?: string;
   operationTypes: OperationType[];
+  pipeline?: Document[];
   watcherId: string;
   sessionId: string;
   onEvent: (event: ChangeEvent) => Promise<void>;
   onError: (error: Error) => void;
 }
 
+export interface MongoWatchConfig extends BaseCfg {
+  collection: string;
+}
+
+export interface MongoDatabaseWatchConfig extends BaseCfg {
+  collections?: string[];
+}
+
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 
-export async function startMongoWatcher(cfg: MongoWatchConfig): Promise<WatcherHandle> {
-  let stopped = false;
-  let resumeToken: ResumeToken | undefined;
-  let eventCount = 0;
-  let lastEventAt: string | undefined;
-  let status: WatcherHandle['status'] = 'active';
+type StreamState = {
+  stopped: boolean;
+  resumeToken: ResumeToken | undefined;
+  eventCount: number;
+  lastEventAt: string | undefined;
+  lastError: string | undefined;
+  status: WatcherHandle['status'];
+  currentStream: ChangeStream | undefined;
+};
 
-  const log = logger.child({ watcherId: cfg.watcherId, sessionId: cfg.sessionId, source: 'mongo' });
+type OpenStream = (client: MongoClient, resumeToken: ResumeToken | undefined) => ChangeStream;
 
-  async function runStream(): Promise<void> {
-    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-      if (stopped) return;
+function buildClient(cfg: BaseCfg): MongoClient {
+  return new MongoClient(cfg.connectionUri, {
+    serverApi: { version: ServerApiVersion.v1, strict: true },
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 10000,
+    ...(cfg.tls !== undefined ? { tls: cfg.tls } : {}),
+    ...(cfg.tlsAllowInvalidCertificates !== undefined ? { tlsAllowInvalidCertificates: cfg.tlsAllowInvalidCertificates } : {}),
+    ...(cfg.tlsCAFile !== undefined ? { tlsCAFile: cfg.tlsCAFile } : {}),
+  });
+}
 
-      const client = new MongoClient(cfg.connectionUri, {
-        serverApi: { version: ServerApiVersion.v1, strict: true },
-        serverSelectionTimeoutMS: 5000,
-        connectTimeoutMS: 10000,
-      });
+function buildStreamOptions(resumeToken: ResumeToken | undefined) {
+  return resumeToken
+    ? { fullDocument: 'updateLookup' as const, resumeAfter: resumeToken }
+    : { fullDocument: 'updateLookup' as const };
+}
+
+async function runMongoStream(
+  cfg: BaseCfg,
+  target: string,
+  openStream: OpenStream,
+  state: StreamState,
+  log: ReturnType<typeof logger.child>,
+): Promise<void> {
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    if (state.stopped) return;
+
+    const client = buildClient(cfg);
+    try {
+      await client.connect();
+      state.status = 'active';
+      state.lastError = undefined;
+      log.info('MongoDB connected', { attempt, target });
+
+      const changeStream = openStream(client, state.resumeToken);
+      state.currentStream = changeStream;
 
       try {
-        await client.connect();
-        log.info('MongoDB connected', { attempt });
+        for await (const change of changeStream as AsyncIterable<SupportedChangeDoc>) {
+          if (state.stopped) break;
+          state.resumeToken = changeStream.resumeToken as ResumeToken;
 
-        const col = client.db(cfg.database).collection<Document>(cfg.collection);
-        const pipeline = [
-          { $match: { operationType: { $in: cfg.operationTypes } } },
-        ];
+          const event = formatMongoEvent(change, cfg.watcherId, cfg.database);
+          state.eventCount++;
+          state.lastEventAt = event.timestamp;
 
-        const streamOptions = resumeToken
-          ? { fullDocument: 'updateLookup' as const, resumeAfter: resumeToken }
-          : { fullDocument: 'updateLookup' as const };
+          metrics.changeEventsTotal.inc({
+            source: 'mongo',
+            operation_type: event.operationType,
+            watcher_id: cfg.watcherId,
+          });
 
-        const changeStream = col.watch(pipeline, streamOptions);
-
-        try {
-          for await (const change of changeStream as AsyncIterable<SupportedChangeDoc>) {
-            if (stopped) break;
-            resumeToken = changeStream.resumeToken;
-
-            const event = formatMongoEvent(change, cfg.watcherId, cfg.database);
-            eventCount++;
-            lastEventAt = event.timestamp;
-
-            metrics.changeEventsTotal.inc({
-              source: 'mongo',
-              operation_type: event.operationType,
-              watcher_id: cfg.watcherId,
-            });
-
-            await cfg.onEvent(event);
-          }
-        } finally {
-          await changeStream.close().catch(() => undefined);
+          await cfg.onEvent(event);
         }
-
-        if (stopped) return;
-        // Stream ended without error — retry
-        log.warn('Change stream ended unexpectedly, reconnecting');
-      } catch (err) {
-        if (stopped) {
-          await client.close().catch(() => undefined);
-          return;
-        }
-
-        const delay = RETRY_DELAYS_MS[attempt];
-        if (delay === undefined) {
-          // Max retries exceeded
-          status = 'error';
-          metrics.watcherErrorsTotal.inc({ source: 'mongo', error_type: 'max_retries_exceeded' });
-          cfg.onError(new Error(`Max reconnect attempts exceeded for watcher ${cfg.watcherId}`));
-          await client.close().catch(() => undefined);
-          return;
-        }
-
-        log.warn('MongoDB change stream error, retrying', {
-          err: err instanceof Error ? err.message : String(err),
-          attempt,
-          retryInMs: delay,
-        });
-        metrics.watcherErrorsTotal.inc({ source: 'mongo', error_type: 'stream_error' });
-        await client.close().catch(() => undefined);
-        await sleep(delay);
-        continue;
       } finally {
-        if (!stopped) {
-          await client.close().catch(() => undefined);
-        }
+        state.currentStream = undefined;
+        await changeStream.close().catch(() => undefined);
       }
+
+      if (state.stopped) return;
+      log.warn('Change stream ended unexpectedly, reconnecting', { target });
+    } catch (err) {
+      if (state.stopped) return;
+
+      const delay = RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) {
+        state.status = 'error';
+        metrics.watcherErrorsTotal.inc({ source: 'mongo', error_type: 'max_retries_exceeded' });
+        cfg.onError(new Error(`Max reconnect attempts exceeded for watcher ${cfg.watcherId}`));
+        return;
+      }
+
+      const errMsg = err instanceof Error ? err.message : String(err);
+      state.lastError = errMsg;
+      state.status = 'retrying';
+      log.warn('MongoDB change stream error, retrying', {
+        err: errMsg,
+        attempt,
+        retryInMs: delay,
+        target,
+      });
+      metrics.watcherErrorsTotal.inc({ source: 'mongo', error_type: 'stream_error' });
+      await sleep(delay);
+    } finally {
+      await client.close().catch(() => undefined);
     }
   }
+}
 
-  // Start in background
-  runStream().catch((err: unknown) => {
-    status = 'error';
-    cfg.onError(err instanceof Error ? err : new Error(String(err)));
-  });
-
-  const handle: WatcherHandle = {
+function buildHandle(cfg: BaseCfg, target: string, state: StreamState): WatcherHandle {
+  return {
     watcherId: cfg.watcherId,
     sessionId: cfg.sessionId,
     source: 'mongo',
-    target: `${cfg.database}.${cfg.collection}`,
+    target,
     createdAt: new Date().toISOString(),
-    get status() { return status; },
-    get eventCount() { return eventCount; },
-    get lastEventAt() { return lastEventAt; },
+    get status() { return state.status; },
+    get eventCount() { return state.eventCount; },
+    get lastEventAt() { return state.lastEventAt; },
+    get lastError() { return state.lastError; },
+    get hasResumeToken() { return state.resumeToken !== undefined; },
     stop: async () => {
-      stopped = true;
-      status = 'stopped';
+      state.stopped = true;
+      state.status = 'stopped';
+      if (state.currentStream) {
+        await state.currentStream.close().catch(() => undefined);
+      }
     },
   };
+}
 
-  return handle;
+export async function startMongoWatcher(cfg: MongoWatchConfig): Promise<WatcherHandle> {
+  const state: StreamState = {
+    stopped: false,
+    resumeToken: undefined,
+    eventCount: 0,
+    lastEventAt: undefined,
+    lastError: undefined,
+    status: 'active',
+    currentStream: undefined,
+  };
+  const target = `${cfg.database}.${cfg.collection}`;
+  const log = logger.child({ watcherId: cfg.watcherId, sessionId: cfg.sessionId, source: 'mongo' });
+
+  const builtPipeline: Document[] = [
+    { $match: { operationType: { $in: cfg.operationTypes } } },
+    ...(cfg.pipeline ?? []),
+  ];
+
+  const openStream: OpenStream = (client, resumeToken) =>
+    client.db(cfg.database).collection<Document>(cfg.collection).watch(builtPipeline, buildStreamOptions(resumeToken));
+
+  runMongoStream(cfg, target, openStream, state, log).catch((err: unknown) => {
+    state.status = 'error';
+    cfg.onError(err instanceof Error ? err : new Error(String(err)));
+  });
+
+  return buildHandle(cfg, target, state);
+}
+
+export async function startMongoDatabaseWatcher(cfg: MongoDatabaseWatchConfig): Promise<WatcherHandle> {
+  const state: StreamState = {
+    stopped: false,
+    resumeToken: undefined,
+    eventCount: 0,
+    lastEventAt: undefined,
+    lastError: undefined,
+    status: 'active',
+    currentStream: undefined,
+  };
+  const collectionLabel = cfg.collections?.length ? cfg.collections.join(',') : '*';
+  const target = `${cfg.database}.[${collectionLabel}]`;
+  const log = logger.child({ watcherId: cfg.watcherId, sessionId: cfg.sessionId, source: 'mongo' });
+
+  const matchStage: Document = { operationType: { $in: cfg.operationTypes } };
+  if (cfg.collections?.length) {
+    matchStage['ns.coll'] = { $in: cfg.collections };
+  }
+  const builtPipeline: Document[] = [
+    { $match: matchStage },
+    ...(cfg.pipeline ?? []),
+  ];
+
+  const openStream: OpenStream = (client, resumeToken) =>
+    client.db(cfg.database).watch(builtPipeline, buildStreamOptions(resumeToken));
+
+  runMongoStream(cfg, target, openStream, state, log).catch((err: unknown) => {
+    state.status = 'error';
+    cfg.onError(err instanceof Error ? err : new Error(String(err)));
+  });
+
+  return buildHandle(cfg, target, state);
 }
 
 function sleep(ms: number): Promise<void> {
